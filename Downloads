@@ -1,0 +1,1864 @@
+import os
+import csv
+import time
+import threading
+import subprocess
+from datetime import datetime, timezone, timedelta
+
+import serial
+import pynmea2
+from flask import Flask, jsonify, render_template, request
+
+
+# ============================================================
+# DESTINY GNSS CONFIGURATION
+# ============================================================
+
+GPS_DEVICE = "/dev/rfcomm0"
+BAUD_RATE = 115200
+
+GPS_MAC = "94:51:DC:57:BE:12"
+RFCOMM_CHANNEL = "1"
+
+DATA_DIR = os.path.expanduser(
+    "~/destiny/gps/data"
+)
+
+# Logging frequency
+LOG_HZ = 2.0
+LOG_INTERVAL = 1.0 / LOG_HZ
+
+# GPS validity timeout
+GPS_LOST_TIMEOUT = 3.0
+
+# If no NMEA is received for this amount of time,
+# consider the serial connection dead.
+NMEA_INACTIVITY_TIMEOUT = 10.0
+
+# Reconnect interval
+RECONNECT_INTERVAL = 5.0
+
+# Serial read timeout
+SERIAL_READ_TIMEOUT = 1.0
+
+
+# ============================================================
+# FLASK
+# ============================================================
+
+app = Flask(__name__)
+
+
+# ============================================================
+# THREAD LOCK
+# ============================================================
+
+state_lock = threading.Lock()
+
+
+# ============================================================
+# GPS STATE
+# ============================================================
+
+gps_state = {
+    "connected": False,
+
+    "nmea_received": False,
+    "nmea_last_received": None,
+
+    "gps_valid": False,
+    "gps_last_valid": None,
+
+    "latitude": None,
+    "longitude": None,
+    "altitude": None,
+
+    "speed_kmh": 0.0,
+
+    "gps_time": None,
+
+    "fix": 0,
+    "satellites": 0,
+    "hdop": None,
+
+    "gps_lost": True,
+
+    "session_id": None,
+    "sample_index": 0,
+
+    "last_rmc": None,
+    "last_gga": None,
+
+    "last_error": None,
+}
+
+
+# ============================================================
+# INTERNAL GNSS VALIDITY
+# ============================================================
+
+rmc_valid = False
+gga_valid = False
+
+
+# ============================================================
+# SESSION
+# ============================================================
+
+current_session_id = None
+session_start_time = None
+session_sample_index = 0
+
+
+def start_session():
+    global current_session_id
+    global session_start_time
+    global session_sample_index
+
+    session_start_time = datetime.now(
+        timezone.utc
+    )
+
+    current_session_id = (
+        session_start_time.strftime(
+            "%Y%m%d_%H%M%S"
+        )
+    )
+
+    session_sample_index = 0
+
+    with state_lock:
+        gps_state["session_id"] = current_session_id
+        gps_state["sample_index"] = 0
+
+    print()
+    print("=" * 60)
+    print(
+        f"[SESSION] START {current_session_id}"
+    )
+    print("=" * 60)
+
+
+def stop_session():
+    global current_session_id
+    global session_start_time
+    global session_sample_index
+
+    if current_session_id is not None:
+
+        print()
+        print("=" * 60)
+        print(
+            f"[SESSION] STOP {current_session_id}"
+        )
+        print("=" * 60)
+
+    current_session_id = None
+    session_start_time = None
+    session_sample_index = 0
+
+    with state_lock:
+        gps_state["session_id"] = None
+        gps_state["sample_index"] = 0
+
+
+# ============================================================
+# CSV
+# ============================================================
+
+CSV_HEADER = [
+    "id",
+    "sample_index",
+    "system_timestamp",
+    "gps_time",
+    "latitude",
+    "longitude",
+    "altitude",
+    "speed_kmh",
+    "fix",
+    "satellites",
+    "hdop",
+    "gps_lost",
+    "session_id",
+    "raw_rmc",
+    "raw_gga",
+]
+
+
+def get_csv_path():
+    """
+    Current day's CSV file.
+
+    Example:
+        gps_log_2026-09-15.csv
+    """
+
+    os.makedirs(
+        DATA_DIR,
+        exist_ok=True
+    )
+
+    date_string = datetime.now().strftime(
+        "%Y-%m-%d"
+    )
+
+    return os.path.join(
+        DATA_DIR,
+        f"gps_log_{date_string}.csv"
+    )
+
+
+def ensure_csv_header(path):
+    """
+    Create CSV file and header if needed.
+    """
+
+    if (
+        not os.path.exists(path)
+        or os.path.getsize(path) == 0
+    ):
+
+        with open(
+            path,
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.writer(f)
+
+            writer.writerow(
+                CSV_HEADER
+            )
+
+
+def log_gps_sample():
+    """
+    Write one GPS sample to today's CSV.
+    """
+
+    global session_sample_index
+
+    with state_lock:
+
+        if current_session_id is None:
+            return
+
+        latitude = gps_state["latitude"]
+        longitude = gps_state["longitude"]
+
+        # Do not write coordinates-less samples
+        # as actual GPS track points.
+        if (
+            latitude is None
+            or longitude is None
+        ):
+            return
+
+        session_sample_index += 1
+
+        gps_state["sample_index"] = (
+            session_sample_index
+        )
+
+        now_utc = datetime.now(
+            timezone.utc
+        )
+
+        row = [
+            now_utc.strftime(
+                "%Y%m%dT%H%M%S.%fZ"
+            ),
+
+            session_sample_index,
+
+            now_utc.isoformat(),
+
+            gps_state["gps_time"],
+
+            gps_state["latitude"],
+
+            gps_state["longitude"],
+
+            gps_state["altitude"],
+
+            gps_state["speed_kmh"],
+
+            gps_state["fix"],
+
+            gps_state["satellites"],
+
+            gps_state["hdop"],
+
+            gps_state["gps_lost"],
+
+            gps_state["session_id"],
+
+            gps_state["last_rmc"],
+
+            gps_state["last_gga"],
+        ]
+
+    path = get_csv_path()
+
+    try:
+
+        ensure_csv_header(path)
+
+        with open(
+            path,
+            "a",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.writer(f)
+            writer.writerow(row)
+
+    except Exception as e:
+
+        print(
+            f"[CSV] Write error: {e}"
+        )
+
+
+# ============================================================
+# CSV LOGGER THREAD
+# ============================================================
+
+def csv_logger_loop():
+
+    print(
+        "[CSV] Logger thread started"
+    )
+
+    while True:
+
+        try:
+            log_gps_sample()
+
+        except Exception as e:
+
+            print(
+                f"[CSV] Logger error: {e}"
+            )
+
+        time.sleep(
+            LOG_INTERVAL
+        )
+
+
+# ============================================================
+# RFCOMM
+# ============================================================
+
+def release_rfcomm():
+
+    try:
+
+        subprocess.run(
+            [
+                "sudo",
+                "-n",
+                "/usr/bin/rfcomm",
+                "release",
+                GPS_DEVICE
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5
+        )
+
+    except Exception:
+        pass
+
+
+def wait_for_device_permission(
+    timeout=5
+):
+    """
+    Wait for /dev/rfcomm0 to appear.
+    """
+
+    start = time.time()
+
+    while (
+        time.time() - start
+        < timeout
+    ):
+
+        if os.path.exists(
+            GPS_DEVICE
+        ):
+
+            return True
+
+        time.sleep(0.2)
+
+    return False
+
+
+def bind_rfcomm():
+
+    print()
+    print(
+        "[BT] Binding DG-PRO1S..."
+    )
+
+    print(
+        f"[BT] MAC     : {GPS_MAC}"
+    )
+
+    print(
+        f"[BT] Channel : {RFCOMM_CHANNEL}"
+    )
+
+    try:
+
+        # Release previous binding first
+        release_rfcomm()
+
+        time.sleep(0.5)
+
+        result = subprocess.run(
+            [
+                "sudo",
+                "-n",
+                "/usr/bin/rfcomm",
+                "bind",
+                GPS_DEVICE,
+                GPS_MAC,
+                RFCOMM_CHANNEL
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+
+        if result.returncode != 0:
+
+            print(
+                "[BT] rfcomm bind failed"
+            )
+
+            if result.stderr:
+                print(
+                    result.stderr.strip()
+                )
+
+            return False
+
+        print(
+            "[BT] rfcomm0 bind successful"
+        )
+
+        if wait_for_device_permission():
+
+            print(
+                "[BT] /dev/rfcomm0 "
+                "permissions ready"
+            )
+
+            return True
+
+        print(
+            "[BT] /dev/rfcomm0 "
+            "did not appear"
+        )
+
+        return False
+
+    except Exception as e:
+
+        print(
+            f"[BT] Bind error: {e}"
+        )
+
+        return False
+
+
+# ============================================================
+# SERIAL
+# ============================================================
+
+serial_connection = None
+
+
+def open_gps_serial():
+
+    global serial_connection
+
+    print(
+        f"[GPS] Opening {GPS_DEVICE}..."
+    )
+
+    try:
+
+        serial_connection = serial.Serial(
+            port=GPS_DEVICE,
+            baudrate=BAUD_RATE,
+            timeout=SERIAL_READ_TIMEOUT
+        )
+
+        print(
+            "[GPS] Serial connection opened"
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            f"[GPS] Serial open error: {e}"
+        )
+
+        serial_connection = None
+
+        return False
+
+
+def close_gps_serial():
+
+    global serial_connection
+
+    if serial_connection is not None:
+
+        try:
+            serial_connection.close()
+        except Exception:
+            pass
+
+    serial_connection = None
+
+    with state_lock:
+        gps_state["connected"] = False
+
+
+# ============================================================
+# NMEA PROCESSING
+# ============================================================
+
+def process_rmc(line):
+
+    global rmc_valid
+
+    try:
+
+        msg = pynmea2.parse(line)
+
+        if not isinstance(
+            msg,
+            pynmea2.types.talker.RMC
+        ):
+            return
+
+        status = getattr(
+            msg,
+            "status",
+            None
+        )
+
+        # Save raw NMEA
+        with state_lock:
+            gps_state["last_rmc"] = line
+
+        if status == "A":
+
+            latitude = msg.latitude
+            longitude = msg.longitude
+
+            speed_knots = (
+                msg.spd_over_grnd
+            )
+
+            if speed_knots is None:
+                speed_knots = 0.0
+
+            speed_kmh = (
+                float(speed_knots)
+                * 1.852
+            )
+
+            with state_lock:
+
+                gps_state["latitude"] = (
+                    latitude
+                )
+
+                gps_state["longitude"] = (
+                    longitude
+                )
+
+                gps_state["speed_kmh"] = (
+                    speed_kmh
+                )
+
+                gps_state["gps_time"] = (
+                    str(msg.timestamp)
+                    if msg.timestamp
+                    else None
+                )
+
+            rmc_valid = True
+
+        else:
+
+            rmc_valid = False
+
+        update_gps_validity()
+
+    except Exception as e:
+
+        print(
+            f"[NMEA] RMC parse error: {e}"
+        )
+
+
+def process_gga(line):
+
+    global gga_valid
+
+    try:
+
+        msg = pynmea2.parse(line)
+
+        if not isinstance(
+            msg,
+            pynmea2.types.talker.GGA
+        ):
+            return
+
+        with state_lock:
+
+            gps_state["last_gga"] = line
+
+            fix = getattr(
+                msg,
+                "gps_qual",
+                0
+            )
+
+            satellites = getattr(
+                msg,
+                "num_sats",
+                0
+            )
+
+            hdop = getattr(
+                msg,
+                "horizontal_dil",
+                None
+            )
+
+            altitude = getattr(
+                msg,
+                "altitude",
+                None
+            )
+
+            try:
+                fix = int(
+                    fix or 0
+                )
+            except Exception:
+                fix = 0
+
+            try:
+                satellites = int(
+                    satellites or 0
+                )
+            except Exception:
+                satellites = 0
+
+            try:
+                hdop = (
+                    float(hdop)
+                    if hdop not in (
+                        None,
+                        ""
+                    )
+                    else None
+                )
+            except Exception:
+                hdop = None
+
+            try:
+                altitude = (
+                    float(altitude)
+                    if altitude not in (
+                        None,
+                        ""
+                    )
+                    else None
+                )
+            except Exception:
+                altitude = None
+
+            gps_state["fix"] = fix
+            gps_state["satellites"] = (
+                satellites
+            )
+            gps_state["hdop"] = hdop
+            gps_state["altitude"] = altitude
+
+        gga_valid = (
+            fix > 0
+        )
+
+        update_gps_validity()
+
+    except Exception as e:
+
+        print(
+            f"[NMEA] GGA parse error: {e}"
+        )
+
+
+def update_gps_validity():
+
+    global current_session_id
+
+    valid = (
+        rmc_valid
+        or gga_valid
+    )
+
+    now = time.time()
+
+    with state_lock:
+
+        gps_state["gps_valid"] = valid
+
+        if valid:
+
+            gps_state["gps_last_valid"] = (
+                now
+            )
+
+            gps_state["gps_lost"] = False
+
+        else:
+
+            last_valid = (
+                gps_state["gps_last_valid"]
+            )
+
+            if (
+                last_valid is None
+                or (
+                    now - last_valid
+                    > GPS_LOST_TIMEOUT
+                )
+            ):
+
+                gps_state["gps_lost"] = True
+
+    # Start a new session after valid GPS appears
+    if valid:
+
+        if current_session_id is None:
+            start_session()
+
+    else:
+
+        with state_lock:
+
+            last_valid = (
+                gps_state["gps_last_valid"]
+            )
+
+        if (
+            current_session_id is not None
+            and last_valid is not None
+            and (
+                now - last_valid
+                > GPS_LOST_TIMEOUT
+            )
+        ):
+
+            stop_session()
+
+
+# ============================================================
+# NMEA READER LOOP
+# ============================================================
+
+def gps_reader_loop():
+
+    global serial_connection
+    global rmc_valid
+    global gga_valid
+
+    print(
+        "[GPS] Starting background "
+        "GNSS reader..."
+    )
+
+    while True:
+
+        # ----------------------------------------------------
+        # Make sure RFCOMM exists
+        # ----------------------------------------------------
+
+        if not os.path.exists(
+            GPS_DEVICE
+        ):
+
+            print(
+                "[BT] /dev/rfcomm0 not found"
+            )
+
+            close_gps_serial()
+
+            success = bind_rfcomm()
+
+            if not success:
+
+                time.sleep(
+                    RECONNECT_INTERVAL
+                )
+
+                continue
+
+        # ----------------------------------------------------
+        # Open serial
+        # ----------------------------------------------------
+
+        if serial_connection is None:
+
+            if not open_gps_serial():
+
+                close_gps_serial()
+
+                time.sleep(
+                    RECONNECT_INTERVAL
+                )
+
+                continue
+
+            print()
+            print(
+                f"[GPS] Connected to "
+                f"{GPS_DEVICE}"
+            )
+
+            print(
+                "[GPS] Waiting for NMEA..."
+            )
+
+            with state_lock:
+                gps_state["connected"] = True
+                gps_state["last_error"] = None
+
+            rmc_valid = False
+            gga_valid = False
+
+        # ----------------------------------------------------
+        # Read NMEA
+        # ----------------------------------------------------
+
+        try:
+
+            raw_line = (
+                serial_connection.readline()
+            )
+
+            # IMPORTANT:
+            # Empty line caused by serial timeout
+            # is NOT considered disconnection.
+            if not raw_line:
+
+                with state_lock:
+
+                    last_nmea = (
+                        gps_state[
+                            "nmea_last_received"
+                        ]
+                    )
+
+                if last_nmea is not None:
+
+                    if (
+                        time.time()
+                        - last_nmea
+                        > NMEA_INACTIVITY_TIMEOUT
+                    ):
+
+                        raise ConnectionError(
+                            "NMEA inactivity timeout"
+                        )
+
+                continue
+
+            try:
+
+                line = (
+                    raw_line
+                    .decode(
+                        "ascii",
+                        errors="ignore"
+                    )
+                    .strip()
+                )
+
+            except Exception:
+
+                continue
+
+            if not line:
+                continue
+
+            # ------------------------------------------------
+            # Update NMEA status
+            # ------------------------------------------------
+
+            now = time.time()
+
+            with state_lock:
+
+                gps_state["nmea_received"] = True
+
+                gps_state[
+                    "nmea_last_received"
+                ] = now
+
+            # ------------------------------------------------
+            # Process message
+            # ------------------------------------------------
+
+            if (
+                line.startswith(
+                    "$GNRMC"
+                )
+                or line.startswith(
+                    "$GPRMC"
+                )
+            ):
+
+                process_rmc(line)
+
+            elif (
+                line.startswith(
+                    "$GNGGA"
+                )
+                or line.startswith(
+                    "$GPGGA"
+                )
+            ):
+
+                process_gga(line)
+
+        except Exception as e:
+
+            print()
+            print(
+                f"[GPS] Connection error: {e}"
+            )
+
+            with state_lock:
+
+                gps_state["last_error"] = (
+                    str(e)
+                )
+
+                gps_state["connected"] = False
+                gps_state["nmea_received"] = False
+
+            close_gps_serial()
+
+            # End current session
+            stop_session()
+
+            print(
+                f"[BT] Reconnecting in "
+                f"{RECONNECT_INTERVAL} seconds..."
+            )
+
+            time.sleep(
+                RECONNECT_INTERVAL
+            )
+
+
+# ============================================================
+# API: CURRENT GPS
+# ============================================================
+
+@app.route("/")
+def index():
+
+    return render_template(
+        "index.html"
+    )
+
+
+@app.route("/api/gps")
+def api_gps():
+
+    with state_lock:
+
+        data = dict(
+            gps_state
+        )
+
+    # Add useful real-time information
+    data["recording"] = (
+        data["session_id"] is not None
+    )
+
+    data["track"] = []
+
+    return jsonify(data)
+
+
+# ============================================================
+# API: HEALTH
+# ============================================================
+
+@app.route("/api/health")
+def api_health():
+
+    with state_lock:
+
+        return jsonify({
+
+            "status": "ok",
+
+            "bluetooth_connected":
+                gps_state[
+                    "connected"
+                ],
+
+            "nmea_received":
+                gps_state[
+                    "nmea_received"
+                ],
+
+            "gps_valid":
+                gps_state[
+                    "gps_valid"
+                ],
+
+            "gps_lost":
+                gps_state[
+                    "gps_lost"
+                ],
+
+            "session_id":
+                gps_state[
+                    "session_id"
+                ],
+        })
+
+
+# ============================================================
+# API: CURRENT DAY TRACK
+# ============================================================
+
+@app.route("/api/track")
+def api_track():
+
+    path = get_csv_path()
+
+    if not os.path.exists(path):
+
+        return jsonify([])
+
+    points = []
+
+    try:
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8",
+            newline=""
+        ) as f:
+
+            reader = csv.DictReader(f)
+
+            for row in reader:
+
+                lat = (
+                    row.get("latitude")
+                    or ""
+                ).strip()
+
+                lon = (
+                    row.get("longitude")
+                    or ""
+                ).strip()
+
+                if not lat or not lon:
+                    continue
+
+                try:
+
+                    points.append({
+
+                        "latitude":
+                            float(lat),
+
+                        "longitude":
+                            float(lon),
+
+                        "session_id":
+                            row.get(
+                                "session_id"
+                            ),
+
+                        "timestamp":
+                            row.get(
+                                "system_timestamp"
+                            ),
+                    })
+
+                except Exception:
+
+                    continue
+
+    except Exception as e:
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+    return jsonify(points)
+
+
+# ============================================================
+# API: FILE LIST
+# ============================================================
+
+@app.route("/api/files")
+def api_files():
+
+    os.makedirs(
+        DATA_DIR,
+        exist_ok=True
+    )
+
+    files = []
+
+    for filename in sorted(
+        os.listdir(DATA_DIR),
+        reverse=True
+    ):
+
+        if not filename.endswith(
+            ".csv"
+        ):
+            continue
+
+        path = os.path.join(
+            DATA_DIR,
+            filename
+        )
+
+        if not os.path.isfile(path):
+            continue
+
+        files.append({
+
+            "filename":
+                filename,
+
+            "size":
+                os.path.getsize(path),
+        })
+
+    return jsonify(files)
+
+
+# ============================================================
+# API: HISTORICAL DATA
+# ============================================================
+
+@app.route("/api/history")
+def api_history():
+
+    """
+    Get historical GNSS data.
+
+    Example:
+
+        /api/history
+        ?date=2026-09-14
+        &from=10:00
+        &to=17:00
+
+    IMPORTANT:
+
+    system_timestamp in CSV is stored as UTC.
+
+    Example:
+
+        2026-09-14T06:45:34+00:00
+
+    Raspberry Pi in Japan:
+
+        UTC 06:45
+            ↓
+        JST 15:45
+
+    Therefore this function converts UTC
+    to local Raspberry Pi time before filtering.
+    """
+
+    date_string = request.args.get(
+        "date",
+        ""
+    )
+
+    from_string = request.args.get(
+        "from",
+        "00:00"
+    )
+
+    to_string = request.args.get(
+        "to",
+        "23:59"
+    )
+
+    session_filter = request.args.get(
+        "session",
+        "all"
+    )
+
+    # ========================================================
+    # Validate DATE
+    # ========================================================
+
+    try:
+
+        selected_date = datetime.strptime(
+            date_string,
+            "%Y-%m-%d"
+        ).date()
+
+    except ValueError:
+
+        return jsonify({
+
+            "error":
+                "Invalid date. "
+                "Use YYYY-MM-DD."
+
+        }), 400
+
+    # ========================================================
+    # Validate TIME
+    # ========================================================
+
+    try:
+
+        start_time = datetime.strptime(
+            from_string,
+            "%H:%M"
+        ).time()
+
+        end_time = datetime.strptime(
+            to_string,
+            "%H:%M"
+        ).time()
+
+    except ValueError:
+
+        return jsonify({
+
+            "error":
+                "Invalid time. "
+                "Use HH:MM."
+
+        }), 400
+
+    # ========================================================
+    # Check time range
+    # ========================================================
+
+    if end_time < start_time:
+
+        return jsonify({
+
+            "error":
+                "End time must be "
+                "greater than start time."
+
+        }), 400
+
+    # ========================================================
+    # Build local time range
+    # ========================================================
+
+    start_dt = datetime.combine(
+        selected_date,
+        start_time
+    )
+
+    # Include the entire selected end minute.
+    #
+    # Example:
+    #
+    # from=10:00
+    # to=17:00
+    #
+    # includes:
+    #
+    # 10:00:00
+    # ...
+    # 17:00:59
+    #
+
+    end_dt = (
+        datetime.combine(
+            selected_date,
+            end_time
+        )
+        + timedelta(minutes=1)
+    )
+
+    # ========================================================
+    # Read ALL CSV files
+    # ========================================================
+
+    os.makedirs(
+        DATA_DIR,
+        exist_ok=True
+    )
+
+    points = []
+
+    files_checked = []
+
+    for filename in sorted(
+        os.listdir(DATA_DIR)
+    ):
+
+        if not filename.lower().endswith(
+            ".csv"
+        ):
+            continue
+
+        path = os.path.join(
+            DATA_DIR,
+            filename
+        )
+
+        if not os.path.isfile(path):
+            continue
+
+        files_checked.append(
+            filename
+        )
+
+        try:
+
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+                newline=""
+            ) as f:
+
+                reader = csv.DictReader(
+                    f
+                )
+
+                for row in reader:
+
+                    # ====================================================
+                    # Timestamp
+                    # ====================================================
+
+                    timestamp_string = (
+                        row.get(
+                            "system_timestamp"
+                        )
+                        or ""
+                    ).strip()
+
+                    if not timestamp_string:
+                        continue
+
+                    try:
+
+                        dt = (
+                            datetime.fromisoformat(
+                                timestamp_string.replace(
+                                    "Z",
+                                    "+00:00"
+                                )
+                            )
+                        )
+
+                        # Old data without timezone
+                        # is assumed UTC.
+                        if dt.tzinfo is None:
+
+                            dt = dt.replace(
+                                tzinfo=timezone.utc
+                            )
+
+                    except Exception:
+
+                        continue
+
+                    # ====================================================
+                    # UTC -> LOCAL TIME
+                    # ====================================================
+
+                    local_dt = (
+                        dt.astimezone()
+                    )
+
+                    local_naive = (
+                        local_dt.replace(
+                            tzinfo=None
+                        )
+                    )
+
+                    # ====================================================
+                    # Filter DATE + TIME
+                    # ====================================================
+
+                    if local_naive < start_dt:
+                        continue
+
+                    if local_naive >= end_dt:
+                        continue
+
+                    # ====================================================
+                    # Session filter
+                    # ====================================================
+
+                    session_id = (
+                        row.get(
+                            "session_id"
+                        )
+                        or ""
+                    ).strip()
+
+                    if (
+                        session_filter != "all"
+                        and session_id
+                        != session_filter
+                    ):
+                        continue
+
+                    # ====================================================
+                    # Latitude
+                    # ====================================================
+
+                    lat_string = (
+                        row.get(
+                            "latitude"
+                        )
+                        or ""
+                    ).strip()
+
+                    # ====================================================
+                    # Longitude
+                    # ====================================================
+
+                    lon_string = (
+                        row.get(
+                            "longitude"
+                        )
+                        or ""
+                    ).strip()
+
+                    # No valid coordinate
+                    if (
+                        not lat_string
+                        or not lon_string
+                    ):
+                        continue
+
+                    try:
+
+                        latitude = float(
+                            lat_string
+                        )
+
+                        longitude = float(
+                            lon_string
+                        )
+
+                    except ValueError:
+
+                        continue
+
+                    # ====================================================
+                    # Numeric helpers
+                    # ====================================================
+
+                    def to_float(value):
+
+                        try:
+
+                            if value in (
+                                None,
+                                "",
+                                "None"
+                            ):
+                                return None
+
+                            return float(value)
+
+                        except Exception:
+
+                            return None
+
+                    def to_int(value):
+
+                        try:
+
+                            if value in (
+                                None,
+                                "",
+                                "None"
+                            ):
+                                return 0
+
+                            return int(
+                                float(value)
+                            )
+
+                        except Exception:
+
+                            return 0
+
+                    # ====================================================
+                    # Create point
+                    # ====================================================
+
+                    point = {
+
+                        "id":
+                            row.get(
+                                "id"
+                            ),
+
+                        "sample_index":
+                            to_int(
+                                row.get(
+                                    "sample_index"
+                                )
+                            ),
+
+                        # Local time
+                        "timestamp":
+                            local_dt.strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),
+
+                        # Original UTC timestamp
+                        "system_timestamp":
+                            row.get(
+                                "system_timestamp"
+                            ),
+
+                        "gps_time":
+                            row.get(
+                                "gps_time"
+                            ),
+
+                        "latitude":
+                            latitude,
+
+                        "longitude":
+                            longitude,
+
+                        "altitude":
+                            to_float(
+                                row.get(
+                                    "altitude"
+                                )
+                            ),
+
+                        "speed_kmh":
+                            to_float(
+                                row.get(
+                                    "speed_kmh"
+                                )
+                            ) or 0.0,
+
+                        "fix":
+                            to_int(
+                                row.get(
+                                    "fix"
+                                )
+                            ),
+
+                        "satellites":
+                            to_int(
+                                row.get(
+                                    "satellites"
+                                )
+                            ),
+
+                        "hdop":
+                            to_float(
+                                row.get(
+                                    "hdop"
+                                )
+                            ),
+
+                        "gps_lost":
+                            str(
+                                row.get(
+                                    "gps_lost",
+                                    ""
+                                )
+                            ).lower()
+                            == "true",
+
+                        "session_id":
+                            session_id,
+
+                        "source_file":
+                            filename,
+                    }
+
+                    points.append(
+                        point
+                    )
+
+        except Exception as e:
+
+            print(
+                f"[HISTORY] Error reading "
+                f"{filename}: {e}"
+            )
+
+    # ========================================================
+    # Sort chronologically
+    # ========================================================
+
+    points.sort(
+        key=lambda p:
+            p.get(
+                "timestamp"
+            ) or ""
+    )
+
+    # ========================================================
+    # Remove duplicate points
+    # ========================================================
+
+    unique_points = []
+
+    seen = set()
+
+    for point in points:
+
+        key = (
+
+            point["timestamp"],
+
+            point["latitude"],
+
+            point["longitude"],
+
+            point["session_id"],
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        unique_points.append(
+            point
+        )
+
+    points = unique_points
+
+    # ========================================================
+    # Sessions
+    # ========================================================
+
+    sessions = sorted({
+
+        p["session_id"]
+
+        for p in points
+
+        if p.get(
+            "session_id"
+        )
+    })
+
+    # ========================================================
+    # Debug information
+    # ========================================================
+
+    print()
+    print(
+        "[HISTORY]"
+    )
+
+    print(
+        f"Date       : {date_string}"
+    )
+
+    print(
+        f"Time       : "
+        f"{from_string} -> {to_string}"
+    )
+
+    print(
+        f"Files      : "
+        f"{len(files_checked)}"
+    )
+
+    print(
+        f"Points     : "
+        f"{len(points)}"
+    )
+
+    print(
+        f"Sessions   : "
+        f"{len(sessions)}"
+    )
+
+    if files_checked:
+
+        print(
+            "[HISTORY] Files:"
+        )
+
+        for filename in files_checked:
+
+            print(
+                f"  - {filename}"
+            )
+
+    print()
+
+    # ========================================================
+    # Return JSON
+    # ========================================================
+
+    return jsonify({
+
+        "date":
+            date_string,
+
+        "from":
+            from_string,
+
+        "to":
+            to_string,
+
+        "count":
+            len(points),
+
+        "sessions":
+            sessions,
+
+        "files_checked":
+            files_checked,
+
+        "points":
+            points,
+    })
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def print_server_info():
+
+    print()
+    print("=" * 65)
+    print("DESTINY GNSS SERVER")
+    print("=" * 65)
+
+    print()
+    print(
+        f"GPS device    : {GPS_DEVICE}"
+    )
+
+    print(
+        f"GPS MAC       : {GPS_MAC}"
+    )
+
+    print(
+        f"RFCOMM channel: {RFCOMM_CHANNEL}"
+    )
+
+    print(
+        f"Baud rate     : {BAUD_RATE}"
+    )
+
+    print(
+        f"Logging rate  : {LOG_HZ} Hz"
+    )
+
+    print(
+        f"GPS timeout   : "
+        f"{GPS_LOST_TIMEOUT} seconds"
+    )
+
+    print(
+        f"NMEA timeout  : "
+        f"{NMEA_INACTIVITY_TIMEOUT} seconds"
+    )
+
+    print(
+        f"Reconnect     : "
+        f"{RECONNECT_INTERVAL} seconds"
+    )
+
+    print(
+        f"Data folder   : {DATA_DIR}"
+    )
+
+    print()
+    print("Web server:")
+    print(
+        "http://0.0.0.0:5000"
+    )
+
+    print()
+    print("=" * 65)
+    print()
+
+
+if __name__ == "__main__":
+
+    print_server_info()
+
+    # ========================================================
+    # GPS READER THREAD
+    # ========================================================
+
+    gps_thread = threading.Thread(
+        target=gps_reader_loop,
+        daemon=True
+    )
+
+    gps_thread.start()
+
+    # ========================================================
+    # CSV LOGGER THREAD
+    # ========================================================
+
+    logger_thread = threading.Thread(
+        target=csv_logger_loop,
+        daemon=True
+    )
+
+    logger_thread.start()
+
+    # ========================================================
+    # FLASK SERVER
+    # ========================================================
+
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False,
+        threaded=True
+    )

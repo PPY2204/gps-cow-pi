@@ -1,0 +1,16 @@
+[subject]
+subject_type = "HUMAN"
+description = "Human researcher walking and running kinematic profile"
+
+[kinematics]
+max_speed_kmh = 35.0
+max_acceleration_ms2 = 6.0
+min_movement_threshold_m = 0.8
+stationary_speed_kmh = 0.6
+max_heading_change_rate_deg_s = 180.0
+
+[behavior]
+resting_speed_max_kmh = 0.5
+walking_speed_min_kmh = 0.5
+walking_speed_max_kmh = 7.0
+running_speed_min_kmh = 7.0

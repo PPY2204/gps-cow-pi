@@ -1,0 +1,16 @@
+[subject]
+subject_type = "BOVINE"
+description = "Cattle grazing and rumination kinematic profile"
+
+[kinematics]
+max_speed_kmh = 25.0
+max_acceleration_ms2 = 3.0
+min_movement_threshold_m = 1.5
+stationary_speed_kmh = 0.5
+max_heading_change_rate_deg_s = 90.0
+
+[behavior]
+resting_speed_max_kmh = 0.3
+grazing_speed_min_kmh = 0.3
+grazing_speed_max_kmh = 1.8
+walking_speed_min_kmh = 1.8

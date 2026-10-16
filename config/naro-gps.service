@@ -1,0 +1,25 @@
+[Unit]
+Description=NARO GNSS Autonomous IoT Logger and Web Dashboard
+After=network.target bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=cow-pi
+WorkingDirectory=/home/cow-pi/naro-gps-nathan
+EnvironmentFile=-/home/cow-pi/naro-gps-nathan/.env
+ExecStart=/bin/bash -c 'exec /home/cow-pi/naro-gps-nathan/.venv/bin/gps record \
+  --port /dev/rfcomm0 \
+  $([ -n "$NARO_DROGGER_MAC" ] && echo "--mac $NARO_DROGGER_MAC") \
+  --device-id "${NARO_DEVICE_ID:-PI-ZERO-01}" \
+  --subject-id "${NARO_SUBJECT_ID:-COW-NARO-001}" \
+  --profile "${NARO_PROFILE:-cow}" \
+  --hz "${NARO_HZ:-1}" \
+  --web --web-port "${NARO_WEB_PORT:-8000}"'
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

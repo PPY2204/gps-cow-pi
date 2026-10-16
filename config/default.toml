@@ -1,0 +1,27 @@
+[device]
+device_id = "PI-ZERO-01"
+mount_type = "COLLAR"
+sampling_rate_hz = 10
+
+[connection]
+port = "/dev/rfcomm0"
+baud_rate = 9600
+timeout_seconds = 2.0
+auto_reconnect = true
+reconnect_delay_seconds = 3.0
+
+[storage]
+raw_dir = "data/raw"
+processed_dir = "data/processed"
+export_dir = "data/exports"
+save_raw = true
+save_csv = true
+save_sqlite = true
+
+[quality]
+min_satellites = 4
+max_hdop = 5.0
+require_fix = true
+
+[profile]
+active = "cow"
