@@ -5,7 +5,7 @@ from human_gps.protocol.gga import parse_gga
 
 
 def test_parse_valid_gga():
-    line = "$GNGGA,012345.00,3540.1234,N,13945.5678,E,1,08,1.2,45.2,M,36.5,M,,*42"
+    line = "$GNGGA,012345.00,3540.1234,N,13945.5678,E,1,08,1.2,45.2,M,36.5,M,,*4B"
     data = parse_gga(line)
     assert data.utc_time == "012345.00"
     assert data.fix_quality == FixQuality.GPS_FIX

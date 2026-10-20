@@ -1,3 +1,6 @@
+# NOTE: Reference specification for human kinematics.
+# In-code defaults are defined in SubjectProfile.human_default() requiring field calibration.
+
 [subject]
 subject_type = "HUMAN"
 description = "Human researcher walking and running kinematic profile"

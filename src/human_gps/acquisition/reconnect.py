@@ -1,14 +1,14 @@
 """Resilient reconnection loop for field IoT GPS acquisition."""
 import logging
+import os
+import subprocess
 import time
-from typing import Callable, Generator, TypeVar
+from typing import Callable, Generator
 
 from human_gps.acquisition.serial_reader import SerialReader
 from human_gps.domain.exceptions import DeviceConnectionError
 
 logger = logging.getLogger(__name__)
-
-T = TypeVar("T")
 
 
 class ResilientStreamReader:
@@ -30,7 +30,6 @@ class ResilientStreamReader:
         self.reconnect_delay = reconnect_delay_seconds
         self.max_retries = max_retries
         self.on_reconnect = on_reconnect_callback
-        import os
         self.mac_address = mac_address or os.environ.get("NARO_DROGGER_MAC")
         self._running = False
         self._reader: SerialReader | None = None
@@ -43,7 +42,6 @@ class ResilientStreamReader:
         while self._running:
             try:
                 # If /dev/rfcomm0 does not exist, try auto-binding to DG-PRO1S if on Linux
-                import os, subprocess
                 if not os.path.exists(self.port) and "rfcomm" in self.port and self.mac_address:
                     logger.info(f"{self.port} not found, attempting auto-bind to {self.mac_address}...")
                     try:

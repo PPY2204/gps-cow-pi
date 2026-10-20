@@ -28,6 +28,7 @@ class EpochSynchronizer:
 
     def __init__(self):
         self._current_bundle: Optional[EpochBundle] = None
+        self._pending_vtg: Optional[tuple[VTGData, str]] = None
 
     def feed_gga(self, gga: GGAData, raw_line: str) -> Optional[EpochBundle]:
         """Feed a GGA sentence. If timestamp changed, emits previous bundle."""
@@ -40,6 +41,11 @@ class EpochSynchronizer:
                     gga=gga,
                     raw_lines=[raw_line],
                 )
+                if self._pending_vtg is not None:
+                    vtg, vtg_raw = self._pending_vtg
+                    self._current_bundle.vtg = vtg
+                    self._current_bundle.raw_lines.append(vtg_raw)
+                    self._pending_vtg = None
                 return emitted
             else:
                 self._current_bundle.gga = gga
@@ -51,13 +57,20 @@ class EpochSynchronizer:
             gga=gga,
             raw_lines=[raw_line],
         )
+        if self._pending_vtg is not None:
+            vtg, vtg_raw = self._pending_vtg
+            self._current_bundle.vtg = vtg
+            self._current_bundle.raw_lines.append(vtg_raw)
+            self._pending_vtg = None
         return None
 
     def feed_vtg(self, vtg: VTGData, raw_line: str) -> None:
-        """Attach VTG to the active epoch bundle."""
+        """Attach VTG to the active epoch bundle or stash if bundle not yet created."""
         if self._current_bundle is not None:
             self._current_bundle.vtg = vtg
             self._current_bundle.raw_lines.append(raw_line)
+        else:
+            self._pending_vtg = (vtg, raw_line)
 
     def feed_rmc(self, rmc: RMCData, raw_line: str) -> Optional[EpochBundle]:
         """Feed RMC data. Can also drive epoch boundaries if GGA is absent."""
@@ -73,6 +86,11 @@ class EpochSynchronizer:
                 rmc=rmc,
                 raw_lines=[raw_line],
             )
+            if self._pending_vtg is not None:
+                vtg, vtg_raw = self._pending_vtg
+                self._current_bundle.vtg = vtg
+                self._current_bundle.raw_lines.append(vtg_raw)
+                self._pending_vtg = None
             return emitted
 
         self._current_bundle = EpochBundle(
@@ -80,10 +98,16 @@ class EpochSynchronizer:
             rmc=rmc,
             raw_lines=[raw_line],
         )
+        if self._pending_vtg is not None:
+            vtg, vtg_raw = self._pending_vtg
+            self._current_bundle.vtg = vtg
+            self._current_bundle.raw_lines.append(vtg_raw)
+            self._pending_vtg = None
         return None
 
     def flush(self) -> Optional[EpochBundle]:
         """Emit any remaining buffered epoch."""
         bundle = self._current_bundle
         self._current_bundle = None
+        self._pending_vtg = None
         return bundle

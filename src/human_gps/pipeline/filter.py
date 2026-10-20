@@ -4,6 +4,7 @@ import statistics
 from typing import Optional
 from human_gps.domain.enums import BehaviorState, QualityFlag, SubjectType
 from human_gps.domain.models import GPSMeasurement, SubjectProfile
+from human_gps.pipeline.measurement import haversine_distance
 
 
 def parse_utc_seconds(utc_str: str) -> Optional[float]:
@@ -64,7 +65,22 @@ class KinematicFilter:
                     dt += 86400.0
 
                 if 0.05 <= dt <= 10.0:  # Valid time window for sequential epochs
-                    dist_m = measurement.distance_from_previous_m
+                    if (
+                        self._last_accepted.latitude is not None
+                        and self._last_accepted.longitude is not None
+                        and measurement.latitude is not None
+                        and measurement.longitude is not None
+                    ):
+                        dist_m = haversine_distance(
+                            self._last_accepted.latitude,
+                            self._last_accepted.longitude,
+                            measurement.latitude,
+                            measurement.longitude,
+                        )
+                        measurement.distance_from_previous_m = round(dist_m, 3)
+                    else:
+                        dist_m = measurement.distance_from_previous_m
+
                     implied_speed_kmh = (dist_m / dt) * 3.6
 
                     # Check implied velocity jump

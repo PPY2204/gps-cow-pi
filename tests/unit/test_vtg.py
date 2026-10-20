@@ -4,7 +4,7 @@ from human_gps.protocol.vtg import parse_vtg
 
 
 def test_parse_valid_vtg():
-    line = "$GNVTG,123.4,T,120.0,M,2.5,N,4.63,K,A*23"
+    line = "$GNVTG,123.4,T,120.0,M,2.5,N,4.63,K,A*0C"
     data = parse_vtg(line)
     assert data.track_true == 123.4
     assert data.track_mag == 120.0

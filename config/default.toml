@@ -1,3 +1,6 @@
+# NOTE: Reference specification / design documentation.
+# Runtime parameters are configured via CLI arguments and .env on the Raspberry Pi.
+
 [device]
 device_id = "PI-ZERO-01"
 mount_type = "COLLAR"

@@ -28,8 +28,26 @@ def get_profile(name: str) -> SubjectProfile:
 
 import http.server
 import json
+import os
 import socketserver
 import threading
+import urllib.parse
+
+
+def is_safe_data_path(target_path: Path) -> bool:
+    """Validate that target_path resolves strictly within an authorized data directory."""
+    try:
+        resolved = target_path.resolve()
+        allowed_roots = [
+            (Path.home() / "naro-gps-nathan" / "data").resolve(),
+            Path("data").resolve(),
+        ]
+        return any(
+            resolved == root or root in resolved.parents
+            for root in allowed_roots
+        )
+    except Exception:
+        return False
 
 
 class LiveStatusHandler(http.server.BaseHTTPRequestHandler):
@@ -112,9 +130,13 @@ class LiveStatusHandler(http.server.BaseHTTPRequestHandler):
 
         elif self.path.startswith("/api/file/delete?file="):
             file_param = self.path.split("/api/file/delete?file=", 1)[1]
-            import urllib.parse
             clean_path = Path(urllib.parse.unquote(file_param))
-            if clean_path.exists() and clean_path.is_file() and "data" in clean_path.parts:
+            if not is_safe_data_path(clean_path):
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            if clean_path.exists() and clean_path.is_file():
                 try:
                     clean_path.unlink()
                     self.send_response(200)
@@ -164,16 +186,21 @@ class LiveStatusHandler(http.server.BaseHTTPRequestHandler):
 
         elif self.path.startswith("/download?file="):
             file_param = self.path.split("/download?file=", 1)[1]
-            import urllib.parse
             clean_path = Path(urllib.parse.unquote(file_param))
-            if clean_path.exists() and clean_path.is_file() and "data" in clean_path.parts:
+            if not is_safe_data_path(clean_path):
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            if clean_path.exists() and clean_path.is_file():
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
                 self.send_header("Content-Disposition", f'attachment; filename="{clean_path.name}"')
                 self.send_header("Content-Length", str(clean_path.stat().st_size))
                 self.end_headers()
                 with open(clean_path, "rb") as f:
-                    self.wfile.write(f.read())
+                    while chunk := f.read(65536):
+                        self.wfile.write(chunk)
                 return
             else:
                 self.send_response(404)
@@ -922,6 +949,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nStopping server...")
         server.shutdown()
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     """Export processed CSV to GeoJSON or clean CSV."""
     in_p = Path(args.input)

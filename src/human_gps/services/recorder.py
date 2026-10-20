@@ -1,6 +1,7 @@
 """Recorder service orchestrating live acquisition, processing, and multi-store persistence."""
 import logging
 from pathlib import Path
+import threading
 import time
 from typing import Generator, Optional
 
@@ -39,7 +40,9 @@ class RecorderService:
         on_measurement: Optional[object] = None,
         on_raw_line: Optional[object] = None,
         is_recording: bool = True,
+        strict_checksum: bool = True,
     ):
+        self._lock = threading.RLock()
         self.session_mgr = session_mgr
         self.profile = profile
         self.health = HealthMonitor()
@@ -51,6 +54,7 @@ class RecorderService:
         self.enable_raw = enable_raw
         self.enable_sqlite = enable_sqlite
         self.is_recording = is_recording
+        self.strict_checksum = strict_checksum
 
         # Instant real-time telemetry dictionary (always updated on every raw sentence)
         self.live_telemetry = {
@@ -66,7 +70,7 @@ class RecorderService:
         }
 
         # Pipeline components
-        self.router = NMEARouter(strict_checksum=False)
+        self.router = NMEARouter(strict_checksum=self.strict_checksum)
         self.synchronizer = EpochSynchronizer()
         self.builder = MeasurementBuilder()
         self.validator = QualityValidator(
@@ -84,43 +88,56 @@ class RecorderService:
             self._init_stores()
 
     def _init_stores(self) -> None:
-        session_id = self.session_mgr.session_id
-        sub_dir = self.session_mgr.subject_dir
-        d_str = self.session_mgr.date_str
+        with self._lock:
+            session_id = self.session_mgr.session_id
+            sub_dir = self.session_mgr.subject_dir
+            d_str = self.session_mgr.date_str
 
-        raw_file = self.raw_dir / sub_dir / d_str / f"{session_id}_raw.nmea"
-        csv_file = self.processed_dir / sub_dir / d_str / f"{session_id}.csv"
-        db_file = self.processed_dir / sub_dir / d_str / f"{session_id}.db"
+            proc_dir = self.processed_dir / sub_dir / d_str
+            raw_dir = self.raw_dir / sub_dir / d_str
 
-        self.raw_store = RawStore(raw_file) if self.enable_raw else None
-        self.csv_store = CSVStore(csv_file)
-        self.sqlite_store = SQLiteStore(db_file) if self.enable_sqlite else None
+            raw_file = raw_dir / f"{session_id}_raw.nmea"
+            csv_file = proc_dir / f"{session_id}.csv"
+            db_file = proc_dir / f"{session_id}.db"
+
+            self.raw_store = RawStore(raw_file) if self.enable_raw else None
+            self.csv_store = CSVStore(csv_file)
+            self.sqlite_store = SQLiteStore(db_file) if self.enable_sqlite else None
+
+            # Persist session metadata JSON alongside processed data
+            try:
+                self.session_mgr.save_metadata(proc_dir)
+            except Exception as e:
+                logger.warning(f"Failed to persist session metadata: {e}")
 
     def start_new_session(self, subject_id: Optional[str] = None) -> str:
         """Close current stores and roll to a new timestamped session."""
-        self.close()
-        sub_id = subject_id or self.session_mgr.metadata.subject_id
-        self.session_mgr = SessionManager(
-            device_id=self.session_mgr.metadata.device_id,
-            subject_id=sub_id,
-            subject_type=self.profile.subject_type,
-            mount_type=self.session_mgr.metadata.mount_type,
-            sampling_rate_hz=self.session_mgr.metadata.sampling_rate_hz,
-        )
-        self._init_stores()
-        self.is_recording = True
-        return self.session_mgr.session_id
+        with self._lock:
+            self.close()
+            sub_id = subject_id or self.session_mgr.metadata.subject_id
+            self.session_mgr = SessionManager(
+                device_id=self.session_mgr.metadata.device_id,
+                subject_id=sub_id,
+                subject_type=self.profile.subject_type,
+                mount_type=self.session_mgr.metadata.mount_type,
+                sampling_rate_hz=self.session_mgr.metadata.sampling_rate_hz,
+            )
+            self._init_stores()
+            self.is_recording = True
+            return self.session_mgr.session_id
 
     def stop_recording(self) -> None:
         """Stop recording and flush stores."""
-        self.is_recording = False
-        self.close()
+        with self._lock:
+            self.is_recording = False
+            self.close()
 
     def process_sentence(self, sentence: str) -> Optional[EpochBundle]:
         """Process a single raw NMEA sentence through router and synchronizer."""
         self.health.record_sentence(sentence)
-        if self.raw_store and self.is_recording:
-            self.raw_store.write_raw(sentence)
+        with self._lock:
+            if self.raw_store and self.is_recording:
+                self.raw_store.write_raw(sentence)
 
         if self.on_raw_line:
             try:
@@ -174,11 +191,12 @@ class RecorderService:
         measurement.quality = self.validator.validate(measurement)
         measurement = self.filter.filter(measurement)
 
-        if self.is_recording:
-            if self.csv_store:
-                self.csv_store.write_measurement(measurement)
-            if self.sqlite_store:
-                self.sqlite_store.write_measurement(measurement)
+        with self._lock:
+            if self.is_recording:
+                if self.csv_store:
+                    self.csv_store.write_measurement(measurement)
+                if self.sqlite_store:
+                    self.sqlite_store.write_measurement(measurement)
 
         self.health.record_measurement(measurement)
         self.latest_measurement = measurement
@@ -204,21 +222,22 @@ class RecorderService:
 
     def close(self) -> None:
         """Cleanly close all stores."""
-        if self.raw_store:
-            try:
-                self.raw_store.close()
-            except Exception:
-                pass
-            self.raw_store = None
-        if self.csv_store:
-            try:
-                self.csv_store.close()
-            except Exception:
-                pass
-            self.csv_store = None
-        if self.sqlite_store:
-            try:
-                self.sqlite_store.close()
-            except Exception:
-                pass
-            self.sqlite_store = None
+        with self._lock:
+            if self.raw_store:
+                try:
+                    self.raw_store.close()
+                except Exception:
+                    pass
+                self.raw_store = None
+            if self.csv_store:
+                try:
+                    self.csv_store.close()
+                except Exception:
+                    pass
+                self.csv_store = None
+            if self.sqlite_store:
+                try:
+                    self.sqlite_store.close()
+                except Exception:
+                    pass
+                self.sqlite_store = None

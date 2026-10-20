@@ -1,3 +1,6 @@
+# NOTE: Reference specification for cattle kinematics.
+# In-code defaults are defined in SubjectProfile.cow_default() requiring field calibration.
+
 [subject]
 subject_type = "BOVINE"
 description = "Cattle grazing and rumination kinematic profile"

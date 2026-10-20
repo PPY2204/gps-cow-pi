@@ -7,20 +7,27 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+import os
+
+
 def is_linux() -> bool:
     return platform.system().lower() == "linux"
 
 
 def bind_rfcomm(
     device_index: int = 0,
-    mac_address: str = "94:51:DC:57:BE:12",
+    mac_address: Optional[str] = None,
     channel: int = 1,
 ) -> Tuple[bool, str]:
     """Execute 'sudo rfcomm bind <dev> <mac> <channel>' on Linux Raspberry Pi."""
     if not is_linux():
         return False, "rfcomm binding is only supported on Linux/Raspberry Pi."
 
-    cmd = ["sudo", "rfcomm", "bind", str(device_index), mac_address, str(channel)]
+    target_mac = mac_address or os.environ.get("NARO_DROGGER_MAC")
+    if not target_mac:
+        return False, "No Bluetooth MAC address provided (set NARO_DROGGER_MAC or pass mac_address)."
+
+    cmd = ["sudo", "rfcomm", "bind", str(device_index), target_mac, str(channel)]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if res.returncode == 0:

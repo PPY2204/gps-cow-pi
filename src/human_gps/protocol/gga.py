@@ -44,7 +44,7 @@ def parse_gga(sentence: str) -> GGAData:
     try:
         fix_int = int(fix_str) if fix_str else 0
         fix_quality = FixQuality(fix_int)
-    except (ValueError, ValueError):
+    except ValueError:
         fix_quality = FixQuality.INVALID
 
     # Parse satellites

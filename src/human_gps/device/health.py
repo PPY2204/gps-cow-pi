@@ -1,5 +1,5 @@
 """Device health, sampling rate estimation, and diagnostic metrics."""
-from collections import Counter
+from collections import Counter, deque
 import time
 from typing import Dict, List, Optional
 from human_gps.domain.models import GPSMeasurement
@@ -19,7 +19,7 @@ class HealthMonitor:
         self.rejection_counts: Counter[str] = Counter()
         self.behavior_counts: Counter[str] = Counter()
 
-        self._recent_timestamps: List[float] = []
+        self._recent_timestamps: deque[float] = deque(maxlen=50)
 
     def record_sentence(self, sentence: str = "") -> None:
         self.total_sentences_read += 1
@@ -31,9 +31,6 @@ class HealthMonitor:
         self.total_epochs += 1
         now = time.time()
         self._recent_timestamps.append(now)
-        # Keep sliding window of last 50 timestamps for instantaneous Hz
-        if len(self._recent_timestamps) > 50:
-            self._recent_timestamps.pop(0)
 
         if measurement.is_accepted:
             self.accepted_epochs += 1
